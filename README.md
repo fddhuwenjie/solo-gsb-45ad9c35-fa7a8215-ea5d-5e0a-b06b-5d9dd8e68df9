@@ -496,8 +496,13 @@ curl -s -X POST localhost:8000/demand-charge -H 'Content-Type: application/json'
 - 以**未舍入能量**选出平均功率最高的窗口（参评窗口等长，功率与能量同序），
   **同值时取 UTC 起点最早者**；需量 kW = 窗口能量 ÷ 窗口小时数，
   需量与费用都按**六位小数四舍五入**计费（`demand_kw`、`amount`）。
-- 费用再按获选窗口内各输入的能量占比分摊（`allocations`），残差并入最后
-  一项，各分摊费用之和严格等于总费用。
+- 费用再按获选窗口内各输入的能量占比分摊（`selected_window.allocations`），
+  残差并入最后一项，各分摊费用之和严格等于总费用。该视图**只覆盖获选
+  窗口**：跨窗输入落在其他窗口中的部分不出现在其中。
+- 独立的 `interval_shares` 字段按 `interval_index` 分组返回**每条原始输入
+  在全部重叠窗口中的切片**（含未参评窗口内的切片，按 UTC 时间递增），
+  与获选窗口无关；每组的 `energy` 为各切片之和，**严格等于该输入的申报
+  能量**——跨窗输入在其他窗口中的能量都能在此对账。
 
 响应（节选）：
 
@@ -534,6 +539,44 @@ curl -s -X POST localhost:8000/demand-charge -H 'Content-Type: application/json'
   },
   "demand_kw": "12.000000",
   "amount": "150.000000",
+  "interval_shares": [
+    {"interval_index": 0, "energy": "3.100000", "slices": [
+      {"window_index": 0,
+       "start": "2024-07-03T20:07:00Z", "end": "2024-07-03T20:15:00Z",
+       "start_local": "2024-07-03T16:07:00-04:00",
+       "end_local": "2024-07-03T16:15:00-04:00",
+       "duration_seconds": 480, "energy": "1.600000"},
+      {"window_index": 1,
+       "start": "2024-07-03T20:15:00Z", "end": "2024-07-03T20:22:30Z",
+       "start_local": "2024-07-03T16:15:00-04:00",
+       "end_local": "2024-07-03T16:22:30-04:00",
+       "duration_seconds": 450, "energy": "1.500000"}
+    ]},
+    {"interval_index": 1, "energy": "4.500000", "slices": [
+      {"window_index": 1,
+       "start": "2024-07-03T20:22:30Z", "end": "2024-07-03T20:30:00Z",
+       "start_local": "2024-07-03T16:22:30-04:00",
+       "end_local": "2024-07-03T16:30:00-04:00",
+       "duration_seconds": 450, "energy": "1.500000"},
+      {"window_index": 2,
+       "start": "2024-07-03T20:30:00Z", "end": "2024-07-03T20:45:00Z",
+       "start_local": "2024-07-03T16:30:00-04:00",
+       "end_local": "2024-07-03T16:45:00-04:00",
+       "duration_seconds": 900, "energy": "3.000000"}
+    ]},
+    {"interval_index": 2, "energy": "1.000000", "slices": [
+      {"window_index": 8,
+       "start": "2024-07-03T22:00:00Z", "end": "2024-07-03T22:15:00Z",
+       "start_local": "2024-07-03T18:00:00-04:00",
+       "end_local": "2024-07-03T18:15:00-04:00",
+       "duration_seconds": 900, "energy": "0.500000"},
+      {"window_index": 9,
+       "start": "2024-07-03T22:15:00Z", "end": "2024-07-03T22:30:00Z",
+       "start_local": "2024-07-03T18:15:00-04:00",
+       "end_local": "2024-07-03T18:30:00-04:00",
+       "duration_seconds": 900, "energy": "0.500000"}
+    ]}
+  ],
   "reason_code": null,
   "reason": null,
   "excluded_windows": [
@@ -554,10 +597,13 @@ curl -s -X POST localhost:8000/demand-charge -H 'Content-Type: application/json'
 获选窗口 `16:15–16:30`（本地）被两段不等长输入各覆盖 7.5 分钟，分摊能量
 各为 1.5 kWh（按各自的实际时长比例），合计 3 kWh → 平均功率 12 kW →
 费用 12 × 12.50 = **150.000000**；逐输入费用各 75.000000，合计严格等于
-总费用。`excluded_windows` 只列出与输入范围相交但未参评的窗口
-（上例已省略其余缺口窗口）；当**没有任何完整窗口**时 HTTP 仍为 200，
-`selected_window` 为 `null`、`demand_kw`/`amount` 为 `0.000000`，
-并给出 `reason_code="no_complete_window"`。
+总费用。`interval_shares` 则给出每条输入的完整去向：输入 0 的 3.1 kWh
+落在窗口 0（1.6，未参评）与窗口 1（1.5），输入 1 的 4.5 kWh 落在窗口 1
+（1.5）与窗口 2（3.0），输入 2 的 1 kWh 平分到窗口 8/9——各组之和分别
+严格等于 3.1 / 4.5 / 1。`excluded_windows` 只列出与输入范围相交但未参评
+的窗口（上例已省略其余缺口窗口）；当**没有任何完整窗口**时 HTTP 仍为
+200，`selected_window` 为 `null`、`demand_kw`/`amount` 为 `0.000000`，
+并给出 `reason_code="no_complete_window"`（`interval_shares` 仍正常返回）。
 
 ### `POST /versions/import`
 
@@ -646,7 +692,7 @@ curl -s -X POST localhost:8000/versions/import -H 'Content-Type: application/jso
 | POST | `/quote-diff` | 两版本对同一组用量区间独立报价并逐段对比（见上） |
 | POST | `/shift-plan` | 两项可移时任务在 8 小时窗口内枚举 30 分钟候选，统一报价选最低费用组合（见上） |
 | POST | `/meter-readings/reconcile` | 累计表计读数对账：排序去重、reset 断列、回卷与采样间隔 gap，产出可直提 `/quote` 的用量区间（见上） |
-| POST | `/demand-charge` | 不等长用量区间按本地午夜对齐的 15/30/60 分钟窗口结算最大需量：DST 感知枚举、按实际时长精确分摊、逐输入能量守恒（见上） |
+| POST | `/demand-charge` | 不等长用量区间按本地午夜对齐的 15/30/60 分钟窗口结算最大需量：DST 感知枚举、按实际时长精确分摊、逐输入能量守恒、逐输入全窗口切片对账（见上） |
 
 ## 错误处理
 
@@ -717,7 +763,7 @@ pip install pytest httpx
 python -m pytest -q
 ```
 
-测试使用内存 SQLite（`StaticPool`），共 106 个用例，覆盖跨日、春秋 DST、
+测试使用内存 SQLite（`StaticPool`），共 111 个用例，覆盖跨日、春秋 DST、
 节假日/调休、跨档切分、重叠与缺口报错、版本对比（原子段对账、
 rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选枚举、
 跨任务共享累计阶梯、同价字典序决胜、规则缺口只淘汰对应候选、
@@ -728,8 +774,10 @@ rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选�
 一次回卷、reset 断列、采样间隔 gap、静止读数、对账不变量与
 接力 `/quote` 的端到端报价，以及 `/demand-charge` 的 15/30/60 分钟
 本地午夜对齐、春秋 DST 窗口计数（92/100 个 15 分钟窗、重复本地边界
-分别成窗）、跨窗按实际微秒时长精确分摊与逐输入能量守恒、同功率取
-最早 UTC 起点、首尾相接连续覆盖、边缘/缺口窗口原因、六位小数计费、
+分别成窗）、跨窗按实际微秒时长精确分摊与逐输入能量守恒、
+`interval_shares` 逐输入全窗口切片分组（普通跨窗、DST、无完整窗口
+场景下各组能量和严格等于原输入）、同功率取最早 UTC 起点、
+首尾相接连续覆盖、边缘/缺口窗口原因、六位小数计费、
 无完整窗口的 `no_complete_window` 与全部输入校验路径。
 
 ## 目录结构

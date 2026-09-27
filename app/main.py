@@ -22,6 +22,8 @@ from .schemas import (
     DemandAllocationOut,
     DemandChargeRequest,
     DemandChargeResponse,
+    DemandIntervalShareOut,
+    DemandIntervalSliceOut,
     DemandWindowOut,
     DiffSegmentOut,
     DiffSideOut,
@@ -302,6 +304,25 @@ def post_demand_charge(req: DemandChargeRequest):
         selected_window=selected,
         demand_kw=str(result.demand_kw.quantize(Q6)),
         amount=str(result.amount.quantize(Q6)),
+        interval_shares=[
+            DemandIntervalShareOut(
+                interval_index=share.interval_index,
+                energy=str(share.energy.quantize(Q6)),
+                slices=[
+                    DemandIntervalSliceOut(
+                        window_index=s.window_index,
+                        start=demand.to_utc_z(s.start),
+                        end=demand.to_utc_z(s.end),
+                        start_local=_local(s.start),
+                        end_local=_local(s.end),
+                        duration_seconds=s.microseconds // 1_000_000,
+                        energy=str(s.energy.quantize(Q6)),
+                    )
+                    for s in share.slices
+                ],
+            )
+            for share in result.interval_shares
+        ],
         reason_code=result.reason_code,
         reason=result.reason,
         excluded_windows=excluded,

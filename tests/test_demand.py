@@ -221,6 +221,154 @@ def test_abutting_inputs_count_as_continuous_coverage():
     assert b["excluded_windows"] == []
 
 
+# ------------------------------------------------------- per-input shares
+
+def test_interval_shares_cover_all_overlapping_windows():
+    """The reported case: abutting inputs 00:00-00:10 (1 kWh) and
+    00:10-00:30 (4 kWh) on a 15-minute grid. The winner [00:15,00:30)
+    holds only 3 kWh of input 1; interval_shares must still return input 0
+    and input 1's 1 kWh slice in the previous window, each group summing
+    exactly to its declared energy."""
+    r = client.post("/demand-charge", json=_req(
+        window_minutes=15,
+        intervals=[
+            {"start": "2024-06-01T00:00:00Z",
+             "end": "2024-06-01T00:10:00Z",
+             "timezone": "UTC", "energy": "1"},
+            {"start": "2024-06-01T00:10:00Z",
+             "end": "2024-06-01T00:30:00Z",
+             "timezone": "UTC", "energy": "4"},
+        ]))
+    assert r.status_code == 200, r.text
+    b = r.json()
+    sw = b["selected_window"]
+    assert sw["start"] == "2024-06-01T00:15:00Z"
+    # Winner-window fee split stays scoped to the winner: only input 1's
+    # 3 kWh slice participates there.
+    assert [(a["interval_index"], a["energy"]) for a in sw["allocations"]] == \
+        [(1, "3.000000")]
+    # The independent per-input view covers every overlapping window.
+    shares = {s["interval_index"]: s for s in b["interval_shares"]}
+    assert set(shares) == {0, 1}
+    assert shares[0]["energy"] == "1.000000"
+    assert [(s["window_index"], s["start"], s["end"], s["energy"])
+            for s in shares[0]["slices"]] == [
+        (0, "2024-06-01T00:00:00Z", "2024-06-01T00:10:00Z", "1.000000"),
+    ]
+    assert shares[1]["energy"] == "4.000000"
+    assert [(s["window_index"], s["start"], s["end"], s["energy"])
+            for s in shares[1]["slices"]] == [
+        (0, "2024-06-01T00:10:00Z", "2024-06-01T00:15:00Z", "1.000000"),
+        (1, "2024-06-01T00:15:00Z", "2024-06-01T00:30:00Z", "3.000000"),
+    ]
+    # Group sums strictly equal the declared inputs.
+    for s in b["interval_shares"]:
+        assert sum(Decimal(x["energy"]) for x in s["slices"]) == \
+            Decimal(s["energy"])
+    # Slice window_index matches the enumerated windows.
+    assert shares[1]["slices"][1]["window_index"] == sw["window_index"]
+
+
+def test_interval_shares_cross_window_proration():
+    # 1500-second interval with 10 kWh: [00:05, 00:30) -> 4 kWh in the
+    # partial window [00:00,00:15) and 6 kWh in the winner [00:15,00:30).
+    r = client.post("/demand-charge", json=_req(
+        window_minutes=15,
+        intervals=[{
+            "start": "2024-06-01T00:05:00Z",
+            "end": "2024-06-01T00:30:00Z",
+            "timezone": "UTC", "energy": "10",
+        }]))
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert len(b["interval_shares"]) == 1
+    share = b["interval_shares"][0]
+    assert share["interval_index"] == 0
+    assert share["energy"] == "10.000000"
+    assert [(s["window_index"], s["duration_seconds"], s["energy"])
+            for s in share["slices"]] == [
+        (0, 600, "4.000000"),
+        (1, 900, "6.000000"),
+    ]
+    # The slice in the partial (non-eligible) window is reported too, even
+    # though that window is excluded from selection.
+    excluded = {e["window_index"] for e in b["excluded_windows"]}
+    assert share["slices"][0]["window_index"] in excluded
+
+
+def test_interval_shares_present_without_complete_window():
+    # No window is fully covered: selected_window is null, but the per-input
+    # shares still list every slice and conserve the input energy.
+    r = client.post("/demand-charge", json=_req(
+        window_minutes=60,
+        intervals=[{
+            "start": "2024-06-01T00:10:00Z",
+            "end": "2024-06-01T00:50:00Z",
+            "timezone": "UTC", "energy": "1",
+        }]))
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["selected_window"] is None
+    assert b["reason_code"] == "no_complete_window"
+    assert len(b["interval_shares"]) == 1
+    share = b["interval_shares"][0]
+    assert share["energy"] == "1.000000"
+    assert sum(Decimal(s["energy"]) for s in share["slices"]) == \
+        Decimal("1.000000")
+    assert [s["window_index"] for s in share["slices"]] == [0]
+    assert share["slices"][0]["duration_seconds"] == 2400
+
+
+def test_interval_shares_engine_conservation_over_dst_fallback():
+    """Fall-back day in New York: the single 25-hour input is prorated over
+    100 fifteen-minute windows; the engine's per-input view must return all
+    100 slices in UTC order, summing exactly to the declared energy."""
+    req = DemandChargeRequest(
+        timezone="America/New_York", window_minutes=15, unit_price="1",
+        intervals=[{
+            "start": "2024-11-03T00:00:00-04:00",
+            "end": "2024-11-04T00:00:00-05:00",
+            "timezone": "America/New_York", "energy": "25",
+        }])
+    res = settle(req)
+    assert len(res.interval_shares) == 1
+    share = res.interval_shares[0]
+    assert share.interval_index == 0
+    assert len(share.slices) == 100
+    assert share.energy == Decimal("25")
+    assert sum((s.energy for s in share.slices), Decimal()) == Decimal("25")
+    assert all(s.energy == Decimal("0.25") for s in share.slices)
+    # Chronological along the UTC timeline, one slice per window.
+    assert [s.window_index for s in share.slices] == list(range(100))
+    starts = [s.start for s in share.slices]
+    assert all(b > a for a, b in zip(starts, starts[1:]))
+
+
+def test_interval_shares_response_over_spring_forward():
+    # 23-hour spring-forward day: response-level check that every one of
+    # the 92 windows appears exactly once in the single input's shares.
+    r = client.post("/demand-charge", json=_req(
+        timezone="America/New_York", window_minutes=15, unit_price="5",
+        intervals=[{
+            "start": "2024-03-10T00:00:00-05:00",
+            "end": "2024-03-11T00:00:00-04:00",
+            "timezone": "America/New_York", "energy": "23",
+        }]))
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["eligible_window_count"] == 92
+    share = b["interval_shares"][0]
+    assert share["energy"] == "23.000000"
+    assert len(share["slices"]) == 92
+    assert sum(Decimal(s["energy"]) for s in share["slices"]) == \
+        Decimal("23.000000")
+    assert [s["window_index"] for s in share["slices"]] == list(range(92))
+    # Local wall labels are echoed with their real offsets (EDT throughout
+    # the day after 02:00; the first slices carry -05:00).
+    assert share["slices"][0]["start_local"] == "2024-03-10T00:00:00-05:00"
+    assert share["slices"][-1]["end_local"] == "2024-03-11T00:00:00-04:00"
+
+
 def test_fee_split_across_inputs_proportional_to_energy():
     # Two abutting inputs with different power share one window: input 0
     # [00:00,00:30) = 3 kWh, input 1 [00:30,01:00) = 9 kWh. The window

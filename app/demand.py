@@ -36,6 +36,9 @@
   选最高值，同值时取 **UTC 起点最早**者。
 * 需量（kW）与费用在六位小数上四舍五入计费；费用再按选中窗口内各输入的
   能量占比分摊到逐输入，残差并入最后一项以保持费用守恒。
+* 结果提供两种逐输入视图：``allocations`` 只覆盖获选窗口内的费用分摊；
+  ``interval_shares`` 按输入分组给出其在**全部**重叠窗口中的切片，
+  每组能量之和严格等于该输入的申报能量。
 """
 from __future__ import annotations
 
@@ -94,6 +97,24 @@ class DemandAllocation:
     energy: Decimal
     demand_kw: Decimal
     amount: Decimal
+
+
+@dataclass(frozen=True)
+class IntervalSlice:
+    """One input interval's share inside one overlapping demand window."""
+    window_index: int
+    start: datetime
+    end: datetime
+    microseconds: int
+    energy: Decimal           # 6-dp prorated share (residual reconciled)
+
+
+@dataclass
+class IntervalShare:
+    """All of one input interval's slices across every overlapping window."""
+    interval_index: int
+    energy: Decimal           # exact slice sum == the input's declared energy
+    slices: list[IntervalSlice]
 
 
 @dataclass
@@ -163,6 +184,29 @@ class DemandResult:
             amount=self.amount - accounted,
         ))
         return out
+
+    @property
+    def interval_shares(self) -> list[IntervalShare]:
+        """Per-input slices across ALL overlapping windows, grouped by
+        ``interval_index`` in input order.
+
+        Unlike ``allocations`` (winner window only), this view covers every
+        window each input touches — eligible or not — so each group's slice
+        energies sum exactly to that input's declared energy. Slices are
+        chronological: windows are enumerated along the UTC timeline.
+        """
+        grouped: dict[int, list[IntervalSlice]] = {}
+        for w in self.windows:
+            for s in w.slices:
+                grouped.setdefault(s.interval_index, []).append(IntervalSlice(
+                    window_index=w.index, start=s.start, end=s.end,
+                    microseconds=s.microseconds, energy=s.energy,
+                ))
+        return [IntervalShare(
+            interval_index=idx,
+            energy=sum((s.energy for s in slices), ZERO),
+            slices=slices,
+        ) for idx, slices in sorted(grouped.items())]
 
 
 def to_utc_z(dt: datetime) -> str:

@@ -442,6 +442,31 @@ class DemandWindowOut(BaseModel):
     allocations: list[DemandAllocationOut]
 
 
+class DemandIntervalSliceOut(BaseModel):
+    window_index: int = Field(
+        ..., description="切片所属需量窗口的编号（与 selected_window / "
+        "excluded_windows 的 window_index 一致）"
+    )
+    start: str = Field(..., description="切片 UTC 起点（Z 后缀）")
+    end: str = Field(..., description="切片 UTC 终点（Z 后缀）")
+    start_local: str
+    end_local: str
+    duration_seconds: int
+    energy: str = Field(
+        ..., description="该输入按实际时长分摊到该窗口的能量（六位小数）"
+    )
+
+
+class DemandIntervalShareOut(BaseModel):
+    interval_index: int = Field(..., description="原始输入区间的下标")
+    energy: str = Field(
+        ..., description="该输入全部切片能量之和，严格等于其申报能量"
+    )
+    slices: list[DemandIntervalSliceOut] = Field(
+        ..., description="该输入在全部重叠窗口中的切片，按 UTC 时间递增"
+    )
+
+
 class ExcludedWindowOut(BaseModel):
     window_index: int
     start: str
@@ -469,6 +494,10 @@ class DemandChargeResponse(BaseModel):
     )
     demand_kw: str = Field(..., description="计费需量 kW（六位小数四舍五入）")
     amount: str = Field(..., description="需量费用（六位小数四舍五入）")
+    interval_shares: list[DemandIntervalShareOut] = Field(
+        ..., description="逐输入在全部重叠窗口中的切片（按 interval_index "
+        "分组，与获选窗口无关）；每组能量之和严格等于该输入的申报能量"
+    )
     reason_code: str | None = Field(
         None, description="无完整参评窗口时为 no_complete_window"
     )
