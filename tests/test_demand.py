@@ -184,6 +184,16 @@ def test_per_input_energy_conservation_engine():
         got = sum((s.energy for w in res.windows for s in w.slices
                    if s.interval_index == idx), Decimal())
         assert got == total
+    # The grouped view exposes the same conservation per input.
+    groups = res.interval_allocations
+    assert [g.interval_index for g in groups] == [0, 1]
+    assert groups[0].energy == Decimal("10.123456")
+    assert groups[1].energy == Decimal("42.7")
+    for g in groups:
+        assert sum((s.energy for s in g.slices), Decimal()) == g.energy
+        # Slices are chronological and carry their window's index.
+        indices = [s.window_index for s in g.slices]
+        assert indices == sorted(indices)
     # Winner allocations conserve both energy and billed amount.
     alloc = res.allocations
     assert sum((a.energy for a in alloc), Decimal()) == res.winner.energy
@@ -282,6 +292,60 @@ def test_fee_residual_lands_on_last_allocation():
         b["selected_window"]["energy"])
 
 
+# ------------------------------------------------- per-input interval slices
+
+def test_interval_allocations_cover_all_overlapping_windows():
+    """Two abutting inputs over two 15-minute windows: input 0
+    [00:00,00:10)=1 kWh, input 1 [00:10,00:30)=4 kWh. The winner is
+    [00:15,00:30) (3 kWh); its ``allocations`` keep only the in-window
+    share, while ``interval_allocations`` must report every input's
+    slices across BOTH windows, each group summing to its input."""
+    r = client.post("/demand-charge", json=_req(
+        window_minutes=15, unit_price="10",
+        intervals=[
+            {"start": "2024-06-01T00:00:00Z",
+             "end": "2024-06-01T00:10:00Z",
+             "timezone": "UTC", "energy": "1"},
+            {"start": "2024-06-01T00:10:00Z",
+             "end": "2024-06-01T00:30:00Z",
+             "timezone": "UTC", "energy": "4"},
+        ]))
+    assert r.status_code == 200, r.text
+    b = r.json()
+    sw = b["selected_window"]
+    assert sw["start"] == "2024-06-01T00:15:00Z"
+    assert sw["energy"] == "3.000000"
+    # In-window fee allocation is unchanged: only input 1's winning slice.
+    assert [(a["interval_index"], a["energy"])
+            for a in sw["allocations"]] == [(1, "3.000000")]
+
+    groups = b["interval_allocations"]
+    assert [g["interval_index"] for g in groups] == [0, 1]
+    # Input 0 lies entirely in the first (non-selected) window.
+    assert groups[0]["energy"] == "1.000000"
+    assert [(s["window_index"], s["start"], s["end"],
+             s["duration_seconds"], s["energy"])
+            for s in groups[0]["slices"]] == [
+        (0, "2024-06-01T00:00:00Z", "2024-06-01T00:10:00Z", 600,
+         "1.000000"),
+    ]
+    # Input 1 straddles the boundary: 5 min -> 1 kWh in window 0,
+    # 15 min -> 3 kWh in window 1 (the selected one).
+    assert groups[1]["energy"] == "4.000000"
+    assert [(s["window_index"], s["start"], s["end"],
+             s["duration_seconds"], s["energy"])
+            for s in groups[1]["slices"]] == [
+        (0, "2024-06-01T00:10:00Z", "2024-06-01T00:15:00Z", 300,
+         "1.000000"),
+        (1, "2024-06-01T00:15:00Z", "2024-06-01T00:30:00Z", 900,
+         "3.000000"),
+    ]
+    # Grouped sums strictly equal the declared input energies.
+    for g, declared in zip(groups, ("1", "4")):
+        assert sum(Decimal(s["energy"]) for s in g["slices"]) == \
+            Decimal(g["energy"]) == Decimal(declared)
+
+
 # --------------------------------------------------------- window eligibility
 
 def test_partial_edge_windows_excluded_with_reasons():
@@ -342,6 +406,15 @@ def test_no_complete_window_returns_200_with_reason():
     assert b["reason_code"] == "no_complete_window"
     assert b["eligible_window_count"] == 0
     assert b["excluded_windows"][0]["reasons"] == ["partial_coverage"]
+    # Per-input slices are still reported even without a selected window:
+    # the whole input lands in the single partial window.
+    groups = b["interval_allocations"]
+    assert [g["interval_index"] for g in groups] == [0]
+    assert groups[0]["energy"] == "1.000000"
+    assert [(s["window_index"], s["start"], s["end"], s["energy"])
+            for s in groups[0]["slices"]] == [
+        (0, "2024-06-01T00:10:00Z", "2024-06-01T00:50:00Z", "1.000000"),
+    ]
 
 
 # ------------------------------------------------------------------ DST cases
@@ -416,6 +489,21 @@ def test_energy_prorated_over_fall_back_windows_along_utc():
     # 0.25 kWh / 0.25 h = 1 kW * 5 = 5
     assert b["demand_kw"] == "1.000000"
     assert b["amount"] == "5.000000"
+    # The single input is sliced into all 100 fall-back windows (the
+    # repeated local 01:xx boundaries included), summing back to 25 kWh.
+    groups = b["interval_allocations"]
+    assert [g["interval_index"] for g in groups] == [0]
+    slices = groups[0]["slices"]
+    assert len(slices) == 100
+    assert [s["window_index"] for s in slices] == list(range(100))
+    assert all(s["energy"] == "0.250000" for s in slices)
+    assert sum(Decimal(s["energy"]) for s in slices) == \
+        Decimal(groups[0]["energy"]) == Decimal("25")
+    # Repeated wall labels appear as distinct slices with distinct offsets.
+    one_fifteen = [s for s in slices
+                   if s["start_local"].endswith("T01:15:00-04:00")
+                   or s["start_local"].endswith("T01:15:00-05:00")]
+    assert len(one_fifteen) == 2
 
 
 def test_cross_local_midnight_reanchors_grid():

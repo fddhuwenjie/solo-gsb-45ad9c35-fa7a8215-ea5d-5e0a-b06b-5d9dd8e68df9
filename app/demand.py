@@ -36,6 +36,10 @@
   选最高值，同值时取 **UTC 起点最早**者。
 * 需量（kW）与费用在六位小数上四舍五入计费；费用再按选中窗口内各输入的
   能量占比分摊到逐输入，残差并入最后一项以保持费用守恒。
+* 获选窗口内的费用分摊（``allocations``）只覆盖该窗口；
+  ``interval_allocations`` 则按 ``interval_index`` 汇总每条原始输入在
+  **全部**重叠窗口（含未参评窗口）中的切片，每组能量之和严格等于该输入的
+  申报能量。
 """
 from __future__ import annotations
 
@@ -94,6 +98,26 @@ class DemandAllocation:
     energy: Decimal
     demand_kw: Decimal
     amount: Decimal
+
+
+@dataclass
+class IntervalSlice:
+    """One input interval's slice inside one specific window (eligible or
+    not); the full-coverage counterpart of :class:`WindowSlice`."""
+    interval_index: int
+    window_index: int
+    start: datetime
+    end: datetime
+    microseconds: int
+    energy: Decimal           # 6-dp prorated share (residual reconciled)
+
+
+@dataclass
+class IntervalAllocation:
+    """All slices of one original input across every window it overlaps."""
+    interval_index: int
+    energy: Decimal                 # sum of slices == declared input energy
+    slices: list[IntervalSlice]
 
 
 @dataclass
@@ -163,6 +187,35 @@ class DemandResult:
             amount=self.amount - accounted,
         ))
         return out
+
+    @property
+    def interval_allocations(self) -> list[IntervalAllocation]:
+        """Every input's slices across ALL enumerated windows, grouped by
+        ``interval_index`` in input order.
+
+        Unlike ``allocations`` (which only covers the winning window), this
+        includes slices inside non-eligible (partial / uncovered-edge)
+        windows, so each group's energies sum exactly to that input's
+        declared energy. Slices within a group are chronological (windows
+        are enumerated along the UTC timeline).
+        """
+        groups: dict[int, list[IntervalSlice]] = {}
+        for w in self.windows:
+            for s in w.slices:
+                groups.setdefault(s.interval_index, []).append(IntervalSlice(
+                    interval_index=s.interval_index,
+                    window_index=w.index,
+                    start=s.start, end=s.end,
+                    microseconds=s.microseconds, energy=s.energy,
+                ))
+        return [
+            IntervalAllocation(
+                interval_index=idx,
+                energy=sum((s.energy for s in slices), ZERO),
+                slices=slices,
+            )
+            for idx, slices in sorted(groups.items())
+        ]
 
 
 def to_utc_z(dt: datetime) -> str:
